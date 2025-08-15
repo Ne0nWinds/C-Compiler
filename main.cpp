@@ -1,254 +1,18 @@
-
-#include <stdint.h>
 #include <string.h>
-#include <stdlib.h>
 #include <stdio.h>
-#include <assert.h>
 #include <uchar.h>
 
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
-using s8 = int8_t;
-using s16 = int16_t;
-using s32 = int32_t;
-using s64 = int64_t;
-using u8 = uint8_t;
-using u16 = uint16_t;
-using u32 = uint32_t;
-using u64 = uint64_t;
-using char8 = char8_t;
-struct memory_arena {
-	void *Base = 0;
-	u64 Offset = 0;
-	u64 Size = 0;
+#include "base.h"
 
-	void Init(u64 InSize) {
-		Size = InSize;
-		Base = malloc(InSize);
-		Offset = 0;
-	}
-
-	void *Push(u64 Size, u64 Alignment = 8) {
-		uintptr_t Result = (uintptr_t)Base + Offset;
-		Result += Alignment - 1;
-		Result &= ~(Alignment - 1);
-
-		Offset = (uintptr_t)Result - (uintptr_t)Base + Size;
-		assert(Offset < this->Size);
-
-		return (void *)Result;
-	}
-
-	template <typename T>
-	T *Push(u64 Alignment = 8) {
-		constexpr u64 Size = sizeof(T);
-		T *Result = (T *)Push(Size);
-		*Result = {};
-		return Result;
-	}
-
-	void Pop(void *Ptr) {
-		assert((uintptr_t)Ptr >= (uintptr_t)Base);
-		uintptr_t OffsetPointer = (uintptr_t)((u8 *)Base + Offset); 
-		assert((uintptr_t)Ptr <= OffsetPointer);
-		Offset = (uintptr_t)Ptr - (uintptr_t)Base;
-	}
-};
-
-struct arena_auto_pop {
-	memory_arena *Arena;
-	void *Base;
-
-	arena_auto_pop(memory_arena *InArena) {
-		Arena = InArena;
-		Base = InArena->Base;
-	}
-
-	~arena_auto_pop() {
-		Arena->Pop(Base);
-	}
-};
-
-static memory_arena Temp = {};
-
-template <typename T>
-struct auto_defer {
-	T Callback;
-	constexpr auto_defer(const T &InCallback) : Callback(InCallback) {}
-	~auto_defer() {
-		Callback();
-	}
-};
-
-template <typename T>
-auto_defer(const T&) -> auto_defer<T>;
-
-#define CONCAT_IMPL(x, y) x##y
-#define CONCAT(x, y) CONCAT_IMPL(x, y)
-#define OnScopeExit(...) const auto CONCAT(_auto_defer_, __COUNTER__) = auto_defer([&]() { __VA_ARGS__; })
-
-#define ArrayLen(Array) (sizeof(Array) / sizeof(Array[0]))
-
-struct string8_builder;
-
-struct string8 {
-	const char8 *Data;
-	u32 Length;
-
-	constexpr string8() : Data(0), Length(0) { }
-
-	constexpr string8(const char8 *CString) : Length(0) {
-		Data = CString;
-		char8 *c = (char8 *)CString;
-		while (*c++) {
-			Length += 1;
-		}
-	}
-
-	constexpr string8(const char8 *CString, u32 InLength) : Data(CString), Length(InLength) { }
-	string8(u64 Value, memory_arena *Arena = &Temp) {
-		*this = FromUnsignedInt(Arena, Value);
-	}
-	string8(s64 Value, memory_arena *Arena = &Temp) {
-		*this = FromSignedInt(Arena, Value);
-	}
-
-	char8 operator[] (u32 Index) const {
-		char8 Result = (Index < Length) ? Data[Index] : 0;
-		return Result;
-	}
-
-	string8 Substring(u32 Start, u32 End) const {
-		assert(Start <= End && End <= Length);
-		string8 Result;
-		Result.Data = Data + Start;
-		Result.Length = End - Start;
-		return Result;
-	}
-
-	char *ToCString(memory_arena *Arena) const {
-		char *Result = (char *)Arena->Push(Length + 1);
-		memcpy(Result, Data, Length);
-		Result[Length] = 0;
-		return Result;
-	}
-
-	static bool AreEqual(const string8 &A, const string8 &B) {
-		if (A.Length != B.Length) return false;
-		for (u32 i = 0; i < A.Length; ++i) {
-			if (A[i] != B[i]) return false;
-		}
-		return true;
-	}
-
-	static void Print(const string8 &String) {
-		if (String.Length) {
-			fwrite(String.Data, 1, String.Length, stdout);
-		}
-	}
-
-	static string8 FromUnsignedInt(memory_arena *Arena, u64 Value) {
-		char8 *Buffer = (char8 *)Arena->Push(20);
-		u32 Length = 0;
-		do {
-			u64 Digit = Value % 10;
-			Length += 1;
-			Buffer[20 - Length] = '0' + (char8)Digit;
-			Value /= 10;
-		} while (Value > 0);
-		return string8(Buffer + (20 - Length), (u32)Length);
-	}
-	static string8 FromSignedInt(memory_arena *Arena, s64 Value) {
-		char8 *Buffer = (char8 *)Arena->Push(21);
-		u32 Length = 0;
-		bool isNegative = Value < 0;
-		if (isNegative) Value = -Value;
-		do {
-			u64 Digit = Value % 10;
-			Length += 1;
-			Buffer[21 - Length] = '0' + (char8)Digit;
-			Value /= 10;
-		} while (Value > 0);
-		if (isNegative) {
-			Length += 1;
-			Buffer[21 - Length] = '-';
-		}
-		return string8(Buffer + (21 - Length), Length);
-	}
-
-	string8_builder operator + (const string8 &Other);
-};
-
-constexpr u64 KB(u64 Bytes) {
-	return Bytes * 1024ULL;
-}
-constexpr u64 MB(u64 Bytes) {
-	return KB(Bytes) * 1024ULL;
-}
-constexpr u64 GB(u64 Bytes) {
-	return MB(Bytes) * 1024ULL;
-}
-
-template <typename T>
-struct linked_list {
-	struct node {
-		node *Next;
-		T Value;
-	};
-	static inline node SentinelNode = {
-		.Next = &SentinelNode,
-	};
-
-	struct iterator {
-		node *Current;
-
-		iterator(node *Start) : Current(Start) { }
-
-		T &Next() {
-			Current = Current->Next;
-			return Current->Value;
-		}
-
-		T &operator*() const {
-			return Current->Value;
-		}
-
-		iterator& operator++() {
-			Next();
-			return *this;
-		}
-
-		bool operator!=(const iterator &Other) const {
-			return Current != Other.Current;
-		}
-	};
-
-	memory_arena *Arena = nullptr;
-	node *Head;
-	node *Tail;
-
-	linked_list() { }
-	linked_list(memory_arena *InArena) : Arena(InArena) {
-		Head = Arena->Push<node>();
-		*Head = SentinelNode;
-		Tail = Head;
-	}
-
-	T *Push(const T &Value) {
-		node *NewNode = Arena->Push<node>();
-		NewNode->Value = Value;
-		NewNode->Next = &SentinelNode;
-		Tail->Next = NewNode;
-		Tail = NewNode;
-		return &NewNode->Value;
-	}
-
-	iterator begin() const { return iterator(Head->Next); }
-	iterator end() const { return iterator(&SentinelNode); }
-};
-
+#ifdef RUN_UNIT_TESTS
+#define XBYAK_NO_EXCEPTION 
+#include "xbyak/xbyak.h"
+#include "unit_tests.cpp"
+#endif
 
 static string8 LoadFile(memory_arena *Arena, string8 FilePath) {
 	arena_auto_pop DeferredPop(&Temp);
@@ -439,17 +203,17 @@ struct parser_state {
 	}
 };
 
-void Expect(bool Condition, const char *Message) {
+static void Expect(bool Condition, const char *Message) {
 	if (!Condition) {
 		Fail("Parse error: %s", Message);
 	}
 }
 
-bool IsUnaryOperator(token_type Type) {
+static bool IsUnaryOperator(token_type Type) {
 	return Type == '~' || Type == '-';
 }
 
-ast_node *Expression(parser_state *State) {
+static ast_node *Expression(parser_state *State) {
 
 	if (State->CurrentToken().Type == '(') {
 		State->AdvanceToken();
@@ -477,8 +241,7 @@ ast_node *Expression(parser_state *State) {
 	return &DefaultAstNode;
 }
 
-ast_node *ParseStatement(parser_state *State) {
-	// For now, we only handle return statements
+static ast_node *ParseStatement(parser_state *State) {
 	Expect(State->CurrentToken().Type == token_type::KeywordReturn, "Expected 'return' keyword");
 	State->AdvanceToken();
 
@@ -491,7 +254,7 @@ ast_node *ParseStatement(parser_state *State) {
 	return ReturnNode;
 }
 
-linked_list<ast_function_declaration> ParseProgram(parser_state *State) {
+static linked_list<ast_function_declaration> ParseProgram(parser_state *State) {
 	linked_list<ast_function_declaration> FunctionList(State->Arena);
 
 	while (State->CurrentToken().Type == token_type::KeywordInt) {
@@ -518,7 +281,7 @@ linked_list<ast_function_declaration> ParseProgram(parser_state *State) {
 	return FunctionList;
 }
 
-void PrettyPrintAst(ast_node *Node, u32 Indent = 0) {
+static void PrettyPrintAst(ast_node *Node, u32 Indent = 0) {
 	if (Node == &DefaultAstNode) return;
 
 	for (u32 i = 0; i < Indent; ++i) {
@@ -559,7 +322,8 @@ namespace assembly {
 	enum class x64_register {
 		Invalid,
 		EAX,
-		R10D
+		R10D,
+		Count
 	};
 	enum class operand_type {
 		Invalid,
@@ -674,7 +438,7 @@ constexpr string8 RegisterToString(assembly::x64_register Register) {
 	return {};
 }
 
-void EmitMovInstruction(string8_builder &Builder, const assembly::operand &Src, const assembly::operand &Dst) {
+static void EmitMovInstruction(string8_builder &Builder, const assembly::operand &Src, const assembly::operand &Dst) {
 	if (Src.Type == assembly::operand_type::StackLocation && Dst.Type == assembly::operand_type::StackLocation) {
 		Builder += string8(u8"  movl ") + Src.StackLocation + u8"(%rbp), %r10d\n";
 		Builder += string8(u8"  %r10, ") + Dst.StackLocation + u8"(%rbp)\n";
@@ -727,7 +491,81 @@ void EmitMovInstruction(string8_builder &Builder, const assembly::operand &Src, 
 	assert(false);
 }
 
-void EmitAssemblyToFile(assembly::function *Function, const string8 &FilePath) {
+using main_function_type = s32(*)();
+
+#ifdef RUN_UNIT_TESTS
+static void LiveJITAssembly(assembly::function *Function, Xbyak::CodeGenerator &x64) {
+	arena_auto_pop DeferredPop(&Temp);
+
+	using namespace Xbyak;
+	using namespace Xbyak::util;
+
+	if (Function->StackSize > 0) {
+		x64.push(rbp);
+		x64.mov(rbp, rsp);
+	}
+
+	const auto EmitMovInstruction = [&x64](assembly::operand Src, assembly::operand Dst) {
+		if (Src.Type == assembly::operand_type::StackLocation && Dst.Type == assembly::operand_type::StackLocation) {
+			x64.mov(r10d, dword[rbp + Src.StackLocation]);
+			x64.mov(dword[rbp + Dst.StackLocation], r10d);
+			return;
+		}
+
+		Reg32 X64Registers[(u32)assembly::x64_register::Count];
+		X64Registers[(u32)assembly::x64_register::EAX] = eax;
+		X64Registers[(u32)assembly::x64_register::R10D] = r10d;
+
+		if (Src.Type == assembly::operand_type::Immediate && Dst.Type == assembly::operand_type::Register) {
+			Reg32 Register = X64Registers[(u32)Dst.Register];
+			x64.mov(Register, (u32)Src.ImmediateValue);
+			return;
+		}
+		if (Src.Type == assembly::operand_type::StackLocation && Dst.Type == assembly::operand_type::Register) {
+			Reg32 DstRegister = X64Registers[(u32)Dst.Register];
+			x64.mov(DstRegister, dword[rbp + Src.StackLocation]);
+			return;
+		}
+		if (Src.Type == assembly::operand_type::Register && Dst.Type == assembly::operand_type::StackLocation) {
+			Reg32 SrcRegister = X64Registers[(u32)Src.Register];
+			x64.mov(dword[rbp + Dst.StackLocation], SrcRegister);
+			return;
+		}
+
+		assert(false);
+	};
+
+	constexpr assembly::operand EAX = { .Type = assembly::operand_type::Register, .Register = assembly::x64_register::EAX };
+
+	for (const assembly::instruction &Instruction : Function->Instructions) {
+		switch (Instruction.Op) {
+			case assembly::operation::Mov: {
+				EmitMovInstruction(Instruction.Src, Instruction.Dst);
+			} break;
+			case assembly::operation::BitwiseNegate: {
+				EmitMovInstruction(Instruction.Src, EAX);
+				x64.not(eax);
+				EmitMovInstruction(EAX, Instruction.Dst);
+			} break;
+			case assembly::operation::Negate: {
+				EmitMovInstruction(Instruction.Src, EAX);
+				x64.neg(eax);
+				EmitMovInstruction(EAX, Instruction.Dst);
+			} break;
+			case assembly::operation::Return: {
+				EmitMovInstruction(Instruction.Src, EAX);
+				if (Function->StackSize > 0) {
+					x64.mov(rsp, rbp);
+					x64.pop(rbp);
+				}
+				x64.ret();
+			} break;
+		}
+	}
+}
+#endif
+
+static void EmitAssemblyToFile(assembly::function *Function, const string8 &FilePath) {
 	arena_auto_pop DeferredPop(&Temp);
 
 	char *Path = FilePath.ToCString(&Temp);
@@ -815,7 +653,7 @@ namespace ir {
 	};
 };
 
-ir::operand EmitExpressionIR(ir::function *Function, ast_node *ExpressionNode) {
+static ir::operand EmitExpressionIR(ir::function *Function, ast_node *ExpressionNode) {
 	switch (ExpressionNode->Type) {
 		case ast_node_type::IntConstant: {
 			return { ir::operand::type::Constant, ExpressionNode->IntValue };
@@ -836,7 +674,7 @@ ir::operand EmitExpressionIR(ir::function *Function, ast_node *ExpressionNode) {
 	return {};
 }
 
-ir::function EmitIR(memory_arena *Arena, const linked_list<ast_function_declaration> &Node) {
+static ir::function EmitIR(memory_arena *Arena, const linked_list<ast_function_declaration> &Node) {
 	const ast_function_declaration &FunctionDecl = *Node.begin();
 
 	ir::function Result;
@@ -854,7 +692,7 @@ ir::function EmitIR(memory_arena *Arena, const linked_list<ast_function_declarat
 	return Result;
 }
 
-assembly::operand IROperandToAssemblyOperand(const ir::operand &IROperand) {
+static assembly::operand IROperandToAssemblyOperand(const ir::operand &IROperand) {
 	assembly::operand Result = {};
 	switch (IROperand.Type) {
 		case ir::operand::type::Constant: {
@@ -869,7 +707,7 @@ assembly::operand IROperandToAssemblyOperand(const ir::operand &IROperand) {
 	return Result;
 }
 
-void PrintAssemblyInstructions(const assembly::function &Function) {
+static void PrintAssemblyInstructions(const assembly::function &Function) {
 	arena_auto_pop DeferredPop(&Temp);
 
 	auto PrintOperand = [&](const assembly::operand &Op, string8_builder &Builder) {
@@ -922,7 +760,7 @@ void PrintAssemblyInstructions(const assembly::function &Function) {
 	string8::Print(Builder.FinalizeString());
 }
 
-assembly::function IRFunctionToAssembly(memory_arena *Arena, const ir::function &Function) {
+static assembly::function IRFunctionToAssembly(memory_arena *Arena, const ir::function &Function) {
 	assembly::function Result;
 	Result.Instructions = linked_list<assembly::instruction>(Arena);
 	Result.Name = Function.Name;
@@ -953,25 +791,16 @@ assembly::function IRFunctionToAssembly(memory_arena *Arena, const ir::function 
 		Result.Instructions.Push(AssemblyInstruction);
 	}
 
+#if 0
 	PrintAssemblyInstructions(Result);
+#endif
 
 	return Result;
 }
 
-s32 main(s32 argc, char **argv) {
+linked_list<token> Tokenize(memory_arena *Arena, const string8 &FileContents) {
 
-	if (argc < 2) {
-		Fail("No input file provided");
-		return -1;
-	}
-
-	memory_arena LexerArena = {};
-	LexerArena.Init(MB(256));
-	Temp.Init(MB(64));
-
-	const string8 FileContents = LoadPreprocessedFile(&LexerArena, (char8 *)argv[1]);
-
-	linked_list<token> TokenList(&LexerArena);
+	linked_list<token> TokenList(Arena);
 
 	char8 CharTable[256] = {0};
 	CharTable['('] = 1;
@@ -1064,25 +893,105 @@ s32 main(s32 argc, char **argv) {
 		Fail("Unexpected character '%c' at index %u (line %u)", c, i - LastNewLineIndex, LineNumber);
 	}
 
-	memory_arena ParserArena = {};
-	ParserArena.Init(MB(256));
+	return TokenList;
+};
+
+void CompileFile(string8 FilePath) {
+	memory_arena Arena = {};
+	Arena.Init(MB(256));
+	OnScopeExit(Temp.Reset());
+
+	string8 FileContents = LoadPreprocessedFile(&Arena, FilePath);
+	linked_list<token> TokenList = Tokenize(&Arena, FileContents);
 
 	parser_state ParserState = {
-		.Arena = &ParserArena,
+		.Arena = &Arena,
 		.Current = TokenList.begin()
 	};
 	linked_list<ast_function_declaration> FunctionList = ParseProgram(&ParserState);
-
-	memory_arena IRArena = {};
-	IRArena.Init(MB(256));
-	ir::function IRFunction = EmitIR(&IRArena, FunctionList);
-
-	memory_arena AssemblyArena = {};
-	AssemblyArena.Init(MB(256));
-	assembly::function AssemblyFunction = IRFunctionToAssembly(&AssemblyArena, IRFunction);
+	ir::function IRFunction = EmitIR(&Arena, FunctionList);
+	assembly::function AssemblyFunction = IRFunctionToAssembly(&Arena, IRFunction);
 
 	constexpr string8 OutputFileName = string8(u8"output.s");
 	EmitAssemblyToFile(&AssemblyFunction, OutputFileName);
+}
+
+#ifdef RUN_UNIT_TESTS
+void CompileUnitTest(string8 SourceCode, s32 ExpectedResult) {
+	memory_arena Arena = {};
+	Arena.Init(MB(256));
+	OnScopeExit(Temp.Reset());
+
+	linked_list<token> TokenList = Tokenize(&Arena, SourceCode);
+	
+	parser_state ParserState = {
+		.Arena = &Arena,
+		.Current = TokenList.begin()
+	};
+	linked_list<ast_function_declaration> FunctionList = ParseProgram(&ParserState);
+	ir::function IRFunction = EmitIR(&Arena, FunctionList);
+	assembly::function AssemblyFunction = IRFunctionToAssembly(&Arena, IRFunction);
+
+	Xbyak::CodeGenerator CodeGenerator;
+	LiveJITAssembly(&AssemblyFunction, CodeGenerator);
+
+	main_function_type Main = CodeGenerator.getCode<main_function_type>();
+	s32 Result = Main();
+	if (Result != ExpectedResult) {
+		char *SourceCodeCString = SourceCode.ToCString(&Arena);
+		printf("\n%s\nExpected: %d\nReturned: %d\n", SourceCodeCString, ExpectedResult, Result);
+		assert(ExpectedResult == Result);
+	}
+}
+#endif
+
+s32 main(s32 argc, char **argv) {
+
+	Temp.Init(MB(64));
+
+	constexpr string8 RunUnitTestsCommand = u8"--unit-tests";
+
+	#if RUN_UNIT_TESTS
+	constexpr bool UnitTestsEnabled = true;
+	#else
+	constexpr bool UnitTestsEnabled = false;
+	#endif
+
+	bool ExecuteUnitTests = false;
+
+	string8 FilePath;
+
+	for (s32 i = 1; i < argc; ++i) {
+		string8 CommandLineArgument = (char8 *)argv[i];
+		if (UnitTestsEnabled && string8::AreEqual(RunUnitTestsCommand, CommandLineArgument)) {
+			ExecuteUnitTests = true;
+			continue;
+		}
+
+		if (CommandLineArgument.EndsWith(u8".c")) {
+			FilePath = CommandLineArgument;
+			continue;
+		}
+	}
+
+	if (!ExecuteUnitTests && FilePath.Length == 0) {
+		Fail("No input file provided");
+	}
+
+#ifdef RUN_UNIT_TESTS
+	if (ExecuteUnitTests && ExecuteUnitTests) {
+		printf("Running Unit Tests...\n");
+		for (const unit_test &UnitTest : UnitTestsPass) {
+			CompileUnitTest(UnitTest.SourceCode, UnitTest.ExpectedResult);
+		}
+		puts(ANSI_GREEN "All unit tests passed!\n" ANSI_RESET);
+	}
+#endif
+
+	if (FilePath.Length > 0) {
+		printf("Compiling File: %s\n\n", (char *)FilePath.Data);
+		CompileFile(FilePath);
+	}
 
 	return 0;
 }
