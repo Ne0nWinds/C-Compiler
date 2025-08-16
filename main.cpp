@@ -132,6 +132,13 @@ void Fail(const char * Message, ...) {
 	fprintf(stderr, "\n");
 	exit(1);
 }
+void PrintError(const char * Message, ...) {
+	va_list Args;
+	va_start(Args, Message);
+	vfprintf(stderr, Message, Args);
+	va_end(Args);
+	fprintf(stderr, "\n");
+}
 
 enum class ast_node_type : u32 {
 	Invalid = 0,
@@ -168,16 +175,45 @@ struct ast_function_declaration {
 	ast_node *FunctionBody = &DefaultAstNode;
 };
 
+struct parser_error {
+	string8 Message;
+	token Token;
+};
+
 struct parser_state {
 	memory_arena *Arena;
-
 	linked_list<token>::iterator Current;
+	bool HasError = false;
+	parser_error Error;
 
 	const token &AdvanceToken() {
 		return Current.Next();
 	}
-	const token &CurrentToken() {
+	const token &CurrentToken() const {
 		return *Current;
+	}
+	void Expect(char ExpectedType, string8 Message) {
+		Expect((token_type)ExpectedType, Message);
+	}
+	void Expect(token_type ExpectedType, const string8 &Message) {
+		const token &CurrentToken = *Current;
+		if (CurrentToken.Type != ExpectedType && !HasError) {
+			HasError = true;
+			Error = parser_error{ Message, CurrentToken };
+		}
+	}
+	void ExpectAndAdvance(token_type ExpectedType, const string8 &Message) {
+		Expect(ExpectedType, Message);
+		AdvanceToken();
+	}
+	void ExpectAndAdvance(char ExpectedType, const string8 &Message) {
+		ExpectAndAdvance((token_type)ExpectedType, Message);
+	}
+	void SetErrorMessage(const string8 &Message) {
+		if (!HasError) {
+			HasError = true;
+			Error = parser_error{ Message, CurrentToken() };
+		}
 	}
 
 	ast_node *PushReturnNode() {
@@ -205,7 +241,7 @@ struct parser_state {
 
 static void Expect(bool Condition, const char *Message) {
 	if (!Condition) {
-		Fail("Parse error: %s", Message);
+		PrintError("Parse error: %s", Message);
 	}
 }
 
@@ -218,8 +254,7 @@ static ast_node *Expression(parser_state *State) {
 	if (State->CurrentToken().Type == '(') {
 		State->AdvanceToken();
 		ast_node *Node = Expression(State);
-		Expect(State->CurrentToken().Type == ')', "Expected ')' to close expression");
-		State->AdvanceToken();
+		State->ExpectAndAdvance(')', u8"Expected ')' to close expression");
 		return Node;
 	}
 
@@ -237,48 +272,46 @@ static ast_node *Expression(parser_state *State) {
 		State->AdvanceToken();
 		return Result;
 	}
-	Fail("Expected an expression, found token type: %u", State->CurrentToken().Type);
+
+	State->SetErrorMessage(u8"Expected an expression");
 	return &DefaultAstNode;
 }
 
 static ast_node *ParseStatement(parser_state *State) {
-	Expect(State->CurrentToken().Type == token_type::KeywordReturn, "Expected 'return' keyword");
-	State->AdvanceToken();
+	State->ExpectAndAdvance(token_type::KeywordReturn, u8"Expected 'return' keyword");
 
 	ast_node *ReturnNode = State->PushReturnNode();
 	ReturnNode->ReturnStatement.Expression = Expression(State);
 
-	Expect(State->CurrentToken().Type == ';', "Expected ';' to end return statement");
-	State->AdvanceToken();
+	State->ExpectAndAdvance(';', u8"Expected ';' to end return statement");
 
 	return ReturnNode;
 }
 
-static linked_list<ast_function_declaration> ParseProgram(parser_state *State) {
+using parse_result = value_or_error<linked_list<ast_function_declaration>, parser_error>;
+static parse_result ParseProgram(parser_state *State) {
 	linked_list<ast_function_declaration> FunctionList(State->Arena);
 
 	while (State->CurrentToken().Type == token_type::KeywordInt) {
 		ast_function_declaration FunctionDecl = {};
 
-		Expect(State->CurrentToken().Type == token_type::KeywordInt, "Function must return int");
-		Expect(State->AdvanceToken().Type == token_type::Identifier, "Expected identifier after 'int' keyword");
+		State->ExpectAndAdvance(token_type::KeywordInt, u8"Function must return int");
+		State->ExpectAndAdvance(token_type::Identifier, u8"Expected identifier after 'int' keyword");
 		FunctionDecl.Name = State->CurrentToken().String;
 
-		Expect(State->AdvanceToken().Type == '(', "Expected '(' after function name");
-		Expect(State->AdvanceToken().Type == token_type::KeywordVoid, "Expected 'void' for function parameters");
-		Expect(State->AdvanceToken().Type == ')', "Expected ')' after function parameters");
-		Expect(State->AdvanceToken().Type == '{', "Expected '{' to start function body");
-		State->AdvanceToken();
+		State->ExpectAndAdvance('(', u8"Expected '(' after function name");
+		State->ExpectAndAdvance(token_type::KeywordVoid, u8"Expected 'void' for function parameters");
+		State->ExpectAndAdvance(')', u8"Expected ')' after function parameters");
+		State->ExpectAndAdvance('{', u8"Expected '{' to start function body");
 
 		FunctionDecl.FunctionBody = ParseStatement(State);
 
-		Expect(State->CurrentToken().Type == '}', "Expected '}' to end function body");
-		State->AdvanceToken();
+		State->ExpectAndAdvance('}', u8"Expected '}' to end function body");
 
 		FunctionList.Push(FunctionDecl);
 	}
 
-	return FunctionList;
+	return !State->HasError ? parse_result(FunctionList) : parse_result(State->Error);
 }
 
 static void PrettyPrintAst(ast_node *Node, u32 Indent = 0) {
@@ -571,7 +604,7 @@ static void EmitAssemblyToFile(assembly::function *Function, const string8 &File
 	char *Path = FilePath.ToCString(&Temp);
 	s32 FileDescriptor = open(Path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (FileDescriptor < 0) {
-		Fail("Failed to open file for writing: %s", Path);
+		PrintError("Failed to open file for writing: %s", Path);
 	}
 	OnScopeExit(close(FileDescriptor));
 
@@ -620,7 +653,7 @@ static void EmitAssemblyToFile(assembly::function *Function, const string8 &File
 	string8 FinalString = Builder.FinalizeString();
 	ssize_t BytesWritten = write(FileDescriptor, FinalString.Data, FinalString.Length);
 	if (BytesWritten < 0) {
-		Fail("Failed to write to file: %s", Path);
+		PrintError("Failed to write to file: %s", Path);
 	}
 }
 
@@ -798,7 +831,14 @@ static assembly::function IRFunctionToAssembly(memory_arena *Arena, const ir::fu
 	return Result;
 }
 
-linked_list<token> Tokenize(memory_arena *Arena, const string8 &FileContents) {
+struct tokenizer_error {
+	string8 ErrorMessage;
+	string8 Line;
+	u32 ColumnIndex;
+	u32 LineNumber;
+};
+
+value_or_error<linked_list<token>, tokenizer_error> Tokenize(memory_arena *Arena, const string8 &FileContents) {
 
 	linked_list<token> TokenList(Arena);
 
@@ -813,15 +853,42 @@ linked_list<token> Tokenize(memory_arena *Arena, const string8 &FileContents) {
 	CharTable['+'] = 1;
 
 	u32 LineNumber = 1;
-	u32 LastNewLineIndex = 0;
+	u32 LineStartIndex = 0;
+
+	const auto CreateError = [&](const string8 &Message, u32 CurrentColumnIndex) -> tokenizer_error {
+		tokenizer_error Result = {};
+
+		Result.ErrorMessage = Message;
+		Result.ColumnIndex = CurrentColumnIndex - LineStartIndex;
+		Result.LineNumber = LineNumber;
+
+		u32 Index = CurrentColumnIndex;
+		while (FileContents[Index + 1] != 0 && FileContents[Index + 1] != '\n') {
+			Index += 1;
+		}
+		Result.Line = FileContents.Substring(LineStartIndex, Index);
+
+		return Result;
+	};
+
+	const auto CreateLineString8 = [&](u32 CurrentColumnIndex) -> string8 {
+		u32 Index = CurrentColumnIndex;
+
+		while (FileContents[Index + 1] != 0 && FileContents[Index + 1] != '\n') {
+			Index += 1;
+		}
+		return FileContents.Substring(LineStartIndex, Index);
+	};
 
 	for (u32 i = 0; i < FileContents.Length;) {
 		char8 c = FileContents[i];
 
 		if (IsWhitespace(c)) {
-			if (c == '\n') LineNumber += 1;
+			if (c == '\n') {
+				LineStartIndex = i + 1;
+				LineNumber += 1;
+			}
 			i += 1;
-			LastNewLineIndex = i;
 			continue;
 		}
 
@@ -832,7 +899,7 @@ linked_list<token> Tokenize(memory_arena *Arena, const string8 &FileContents) {
 			} while (IsAlphaNumeric(FileContents[i]));
 
 			if (!IsWhitespace(FileContents[i]) && !CharTable[FileContents[i]]) {
-				Fail("Invalid identifier or keyword at index %u: '%c' (line %u)", i - LastNewLineIndex, FileContents[i], LineNumber);
+				return CreateError(u8"Invalid character after identifer or keyword", i);
 			}
 			string8 IdentifierOrKeyword = FileContents.Substring(StartIndex, i);
 			token_type Type = GetAlphaNumericType(IdentifierOrKeyword);
@@ -849,11 +916,8 @@ linked_list<token> Tokenize(memory_arena *Arena, const string8 &FileContents) {
 				i += 1;
 			} while (IsNumeric(FileContents[i]));
 
-			if (IsAlpha(FileContents[i]) || FileContents[i] == '_') {
-				Fail("Invalid numeric constant at index %u: '%c' (line %u)", i - LastNewLineIndex, FileContents[i], LineNumber);
-			}
-			if (!IsWhitespace(FileContents[i]) && !CharTable[FileContents[i]]) {
-				Fail("Invalid numeric constant at index %u: '%c' (line %u)", i - LastNewLineIndex, FileContents[i], LineNumber);
+			if (!IsWhitespace(FileContents[i]) && !CharTable[FileContents[i]] || IsAlpha(FileContents[i])) {
+				return CreateError(u8"Invalid character in numeric constant", i);
 			}
 
 			u32 Value = 0;
@@ -890,11 +954,57 @@ linked_list<token> Tokenize(memory_arena *Arena, const string8 &FileContents) {
 			continue;
 		}
 
-		Fail("Unexpected character '%c' at index %u (line %u)", c, i - LastNewLineIndex, LineNumber);
+		return CreateError(u8"Unexpected character", i);
 	}
 
 	return TokenList;
 };
+
+value_or_error<assembly::function, bool> CompileSourceCode(string8 SourceCode, bool ShowErrors, memory_arena *Arena) {
+	auto TokenListOrError = Tokenize(Arena, SourceCode);
+	if (TokenListOrError.HasError) {
+		if (ShowErrors) {
+			const tokenizer_error &Error = TokenListOrError.Error;
+
+			string8_builder Builder(&Temp);
+			Builder += Error.ErrorMessage;
+			Builder += u8" on line ";
+			Builder += string8::FromUnsignedInt(&Temp, Error.LineNumber);
+			Builder += u8"\n";
+			Builder += Error.Line;
+			Builder += u8"\n";
+
+			char8 *Gap = (char8 *)Temp.Push(Error.ColumnIndex);
+			for (u32 i = 0; i < Error.ColumnIndex; ++i) {
+				Gap[i] = ' ';
+			}
+			Builder += { Gap, Error.ColumnIndex };
+			Builder += u8"^\n";
+
+			for (const string8 &string : Builder.StringList) {
+				string8::Print(string);
+			}
+		}
+		return false;
+	}
+	const linked_list<token> &TokenList = TokenListOrError.Value;
+
+	parser_state ParserState = {
+		.Arena = Arena,
+		.Current = TokenList.begin()
+	};
+	parse_result ParseResult = ParseProgram(&ParserState);
+	if (ParseResult.HasError) {
+		string8::Print(u8"Parse Error: ");
+		string8::Print(ParseResult.Error.Message);
+		string8::Print(u8"\n");
+		return false;
+	}
+	ir::function IRFunction = EmitIR(Arena, ParseResult.Value);
+	assembly::function AssemblyFunction = IRFunctionToAssembly(Arena, IRFunction);
+
+	return AssemblyFunction;
+}
 
 void CompileFile(string8 FilePath) {
 	memory_arena Arena = {};
@@ -902,36 +1012,31 @@ void CompileFile(string8 FilePath) {
 	OnScopeExit(Temp.Reset());
 
 	string8 FileContents = LoadPreprocessedFile(&Arena, FilePath);
-	linked_list<token> TokenList = Tokenize(&Arena, FileContents);
+	auto AssemblyFunctionOrError = CompileSourceCode(FileContents, true, &Arena);
 
-	parser_state ParserState = {
-		.Arena = &Arena,
-		.Current = TokenList.begin()
-	};
-	linked_list<ast_function_declaration> FunctionList = ParseProgram(&ParserState);
-	ir::function IRFunction = EmitIR(&Arena, FunctionList);
-	assembly::function AssemblyFunction = IRFunctionToAssembly(&Arena, IRFunction);
+	if (AssemblyFunctionOrError.HasError) {
+		return;
+	}
+
+	assembly::function AssemblyFunction = AssemblyFunctionOrError.Value;
 
 	constexpr string8 OutputFileName = string8(u8"output.s");
 	EmitAssemblyToFile(&AssemblyFunction, OutputFileName);
 }
 
 #ifdef RUN_UNIT_TESTS
-void CompileUnitTest(string8 SourceCode, s32 ExpectedResult) {
+bool CompileUnitTest(string8 SourceCode, s32 ExpectedResult) {
 	memory_arena Arena = {};
 	Arena.Init(MB(256));
 	OnScopeExit(Temp.Reset());
 
-	linked_list<token> TokenList = Tokenize(&Arena, SourceCode);
-	
-	parser_state ParserState = {
-		.Arena = &Arena,
-		.Current = TokenList.begin()
-	};
-	linked_list<ast_function_declaration> FunctionList = ParseProgram(&ParserState);
-	ir::function IRFunction = EmitIR(&Arena, FunctionList);
-	assembly::function AssemblyFunction = IRFunctionToAssembly(&Arena, IRFunction);
+	auto AssemblyFunctionOrError = CompileSourceCode(SourceCode, ShowCompilerErrorsInUnitTests, &Arena);
 
+	if (AssemblyFunctionOrError.HasError) {
+		return false;
+	}
+
+	assembly::function AssemblyFunction = AssemblyFunctionOrError.Value;
 	Xbyak::CodeGenerator CodeGenerator;
 	LiveJITAssembly(&AssemblyFunction, CodeGenerator);
 
@@ -940,8 +1045,10 @@ void CompileUnitTest(string8 SourceCode, s32 ExpectedResult) {
 	if (Result != ExpectedResult) {
 		char *SourceCodeCString = SourceCode.ToCString(&Arena);
 		printf("\n%s\nExpected: %d\nReturned: %d\n", SourceCodeCString, ExpectedResult, Result);
-		assert(ExpectedResult == Result);
+		return false;
 	}
+
+	return true;
 }
 #endif
 
@@ -975,20 +1082,29 @@ s32 main(s32 argc, char **argv) {
 	}
 
 	if (!ExecuteUnitTests && FilePath.Length == 0) {
-		Fail("No input file provided");
+		PrintError("No input file provided");
 	}
 
 #ifdef RUN_UNIT_TESTS
 	if (ExecuteUnitTests && ExecuteUnitTests) {
 		printf("Running Unit Tests...\n");
 		for (const unit_test &UnitTest : UnitTestsPass) {
-			CompileUnitTest(UnitTest.SourceCode, UnitTest.ExpectedResult);
+			Temp.Reset();
+			bool Result = CompileUnitTest(UnitTest.SourceCode, UnitTest.ExpectedResult);
+			assert(Result == true);
 		}
-		puts(ANSI_GREEN "All unit tests passed!\n" ANSI_RESET);
+
+		for (const string8 &UnitTest : UnitTestsFail) {
+			Temp.Reset();
+			bool Result = CompileUnitTest(UnitTest, 0);
+			assert(Result == false);
+		}
+		puts(ANSI_GREEN "All unit tests passed!" ANSI_RESET);
 	}
 #endif
 
 	if (FilePath.Length > 0) {
+		Temp.Reset();
 		printf("Compiling File: %s\n\n", (char *)FilePath.Data);
 		CompileFile(FilePath);
 	}

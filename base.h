@@ -250,6 +250,11 @@ struct linked_list {
 		*Head = SentinelNode;
 		Tail = Head;
 	}
+	linked_list(const linked_list<T> &InLinkedList) {
+		Arena = InLinkedList.Arena;
+		Head = InLinkedList.Head;
+		Tail = InLinkedList.Tail;
+	}
 
 	T *Push(const T &Value) {
 		node *NewNode = Arena->Push<node>();
@@ -260,9 +265,30 @@ struct linked_list {
 		return &NewNode->Value;
 	}
 
+	operator bool () const {
+		return Head->Next != &SentinelNode;
+	}
+
 	iterator begin() const { return iterator(Head->Next); }
 	iterator end() const { return iterator(&SentinelNode); }
 };
 
 #define ANSI_GREEN "\033[0;32m"
 #define ANSI_RESET "\033[0m"
+
+template <typename value_type, typename error_type>
+struct value_or_error {
+	bool HasError = false;
+	union {
+		value_type Value;
+		error_type Error;
+	};
+
+	value_or_error(const value_type &InValue) : Value(InValue), HasError(false) { }
+	value_or_error(const error_type &InError) : Error(InError), HasError(true) { }
+
+	void SetError(const error_type &InError) {
+		HasError = true;
+		Error = InError;
+	}
+};

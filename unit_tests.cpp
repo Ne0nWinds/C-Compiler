@@ -46,9 +46,22 @@ static constexpr unit_test UnitTestsPass[] = {
     },
 };
 
+static constexpr bool ShowCompilerErrorsInUnitTests = false;
 static string8 UnitTestsFail[] = {
     u8"int main(void) {\n"
-    u8"  return ;\n"
+    u8"  return &2;\n"
+    u8"}",
+
+    u8"int main(void) {\n"
+    u8"  return 2$;\n"
+    u8"}",
+
+    u8"int main(void) {\n"
+    u8"  return value!;\n"
+    u8"}",
+
+    u8"int main(void) {\n"
+    u8"  retun 2;\n"
     u8"}",
 
     u8"int main(void) {\n"
