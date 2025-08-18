@@ -28,9 +28,9 @@ static constexpr unit_test UnitTestsPass[] = {
     },
     {
         u8"int main(void) {\n"
-        u8"  return -(-2);\n"
+        u8"  return -(-1024);\n"
         u8"}",
-        2
+        1024
     },
     {
         u8"int main(void) {\n"
