@@ -44,6 +44,42 @@ static constexpr unit_test UnitTestsPass[] = {
         u8"}",
         -(-(-(-(-(-(98))))))
     },
+    {
+        u8"int main(void) {\n"
+        u8"  return 2 + 2;\n"
+        u8"}",
+        4
+    },
+    {
+        u8"int main(void) {\n"
+        u8"  return 10 + 5 + 5;\n"
+        u8"}",
+        20
+    },
+    {
+        u8"int main(void) {\n"
+        u8"  return 10 + 5 - 7;\n"
+        u8"}",
+        8
+    },
+    {
+        u8"int main(void) {\n"
+        u8"  return -10 + 5 + -8;\n"
+        u8"}",
+        -10 + 5 + -8
+    },
+    {
+        u8"int main(void) {\n"
+        u8"  return -~-(~9);\n"
+        u8"}",
+        -~-(~9)
+    },
+    {
+        u8"int main(void) {\n"
+        u8"  return -~-(~9) + -89 - ~67;\n"
+        u8"}",
+        -~-(~9) + -89 - ~67
+    },
 };
 
 static constexpr bool ShowCompilerErrorsInUnitTests = false;

@@ -41,9 +41,7 @@ static string8 LoadFile(memory_arena *Arena, string8 FilePath) {
 static string8 LoadPreprocessedFile(memory_arena *Arena, string8 FilePath) {
 	arena_auto_pop DeferredPop(&Temp);
 
-	char *Path = FilePath.ToCString(&Temp);
-
-	string8 Command = Format(&Temp, u8"clang -E -P {}", Path);
+	string8 Command = Format(&Temp, "clang -E -P {}", FilePath);
 
 	FILE *Pipe = popen(Command.ToCString(&Temp), "r");
 	if (!Pipe) return {};
@@ -51,7 +49,7 @@ static string8 LoadPreprocessedFile(memory_arena *Arena, string8 FilePath) {
 	OnScopeExit(pclose(Pipe));
 
 	string8 Result = {};
-	const size_t ChunkSize = 8192;
+	const size_t ChunkSize = 1024 * 4;
 	Result.Data = (char8 *)Arena->Push(0);
 	Result.Length = 0;
 	while (true) {
@@ -88,17 +86,17 @@ struct token {
 	};
 };
 
-constexpr inline bool IsAlpha(const u8 c) {
+constexpr inline bool IsAlpha(const char8 c) {
 	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c == '_';
 }
-constexpr inline bool IsNumeric(const u8 c) {
+constexpr inline bool IsNumeric(const char8 c) {
 	return c >= '0' && c <= '9';
 }
-constexpr inline bool IsAlphaNumeric(const u8 c) {
+constexpr inline bool IsAlphaNumeric(const char8 c) {
 	return IsAlpha(c) || IsNumeric(c);
 }
 
-constexpr inline bool IsWhitespace(const u8 c) {
+constexpr inline bool IsWhitespace(const char8 c) {
 	return c == ' ' || c == '\r' || c == '\n' || c == '\t';
 }
 
@@ -108,9 +106,9 @@ struct keyword_metadata {
 };
 
 static keyword_metadata Keywords[] = {
-	{ string8(u8"int"), KeywordInt },
-	{ string8(u8"void"), KeywordVoid },
-	{ string8(u8"return"), KeywordReturn }
+	{ string8("int"), KeywordInt },
+	{ string8("void"), KeywordVoid },
+	{ string8("return"), KeywordReturn }
 };
 
 inline token_type GetAlphaNumericType(const string8 &String) {
@@ -149,6 +147,11 @@ enum class ast_node_type : u32 {
 	Return,
 	UnaryNegate,
 	UnaryBitwiseNegate,
+
+	Add,
+	Subtract,
+	Multiply,
+	Division,
 };
 
 struct ast_node {
@@ -163,6 +166,11 @@ struct ast_node {
 		struct {
 			ast_node *Expression;
 		} UnaryOperation;
+
+		struct {
+			ast_node *Left;
+			ast_node *Right;
+		} BinaryOperation;
 	};
 };
 
@@ -249,23 +257,9 @@ static bool IsUnaryOperator(token_type Type) {
 	return Type == '~' || Type == '-';
 }
 
-static ast_node *Expression(parser_state *State) {
+static ast_node *Expression(parser_state *State);
 
-	if (State->CurrentToken().Type == '(') {
-		State->AdvanceToken();
-		ast_node *Node = Expression(State);
-		State->ExpectAndAdvance(')', u8"Expected ')' to close expression");
-		return Node;
-	}
-
-	if (IsUnaryOperator(State->CurrentToken().Type)) {
-		ast_node_type UnaryType = (State->CurrentToken().Type == '-') ? ast_node_type::UnaryNegate : ast_node_type::UnaryBitwiseNegate;
-		State->AdvanceToken();
-		ast_node *Result = State->PushUnaryOperationNode(UnaryType);
-		Result->UnaryOperation.Expression = Expression(State);
-		return Result;
-	}
-
+static ast_node *Factor(parser_state *State) {
 	if (State->CurrentToken().Type == token_type::IntConstant) {
 		u64 Value = State->CurrentToken().Constant;
 		ast_node *Result = State->PushIntConstantNode(Value);
@@ -273,17 +267,51 @@ static ast_node *Expression(parser_state *State) {
 		return Result;
 	}
 
-	State->SetErrorMessage(u8"Expected an expression");
+	if (IsUnaryOperator(State->CurrentToken().Type)) {
+		ast_node_type UnaryType = (State->CurrentToken().Type == '-') ? ast_node_type::UnaryNegate : ast_node_type::UnaryBitwiseNegate;
+		State->AdvanceToken();
+		ast_node *Result = State->PushUnaryOperationNode(UnaryType);
+		Result->UnaryOperation.Expression = Factor(State);
+		return Result;
+	}
+
+	if (State->CurrentToken().Type == '(') {
+		State->AdvanceToken();
+		ast_node *Node = Expression(State);
+		State->ExpectAndAdvance(')', "Expected ')' to close expression");
+		return Node;
+	}
+
+	State->SetErrorMessage("Expected an expression");
 	return &DefaultAstNode;
 }
 
+static ast_node *Expression(parser_state *State) {
+
+	ast_node *Result = Factor(State);
+
+	while (State->CurrentToken().Type == '+' || State->CurrentToken().Type == '-') {
+		const token_type TokenType = State->CurrentToken().Type;
+		State->AdvanceToken();
+
+		ast_node *BinaryNode = State->Arena->Push<ast_node>();
+		BinaryNode->Type = (TokenType == '+') ? ast_node_type::Add : ast_node_type::Subtract;
+		BinaryNode->BinaryOperation.Left = Result;
+		BinaryNode->BinaryOperation.Right = Factor(State);
+
+		Result = BinaryNode;
+	}
+
+	return Result;
+}
+
 static ast_node *ParseStatement(parser_state *State) {
-	State->ExpectAndAdvance(token_type::KeywordReturn, u8"Expected 'return' keyword");
+	State->ExpectAndAdvance(token_type::KeywordReturn, "Expected 'return' keyword");
 
 	ast_node *ReturnNode = State->PushReturnNode();
 	ReturnNode->ReturnStatement.Expression = Expression(State);
 
-	State->ExpectAndAdvance(';', u8"Expected ';' to end return statement");
+	State->ExpectAndAdvance(';', "Expected ';' to end return statement");
 
 	return ReturnNode;
 }
@@ -295,18 +323,18 @@ static parse_result ParseProgram(parser_state *State) {
 	while (State->CurrentToken().Type == token_type::KeywordInt) {
 		ast_function_declaration FunctionDecl = {};
 
-		State->ExpectAndAdvance(token_type::KeywordInt, u8"Function must return int");
-		State->ExpectAndAdvance(token_type::Identifier, u8"Expected identifier after 'int' keyword");
+		State->ExpectAndAdvance(token_type::KeywordInt, "Function must return int");
+		State->ExpectAndAdvance(token_type::Identifier, "Expected identifier after 'int' keyword");
 		FunctionDecl.Name = State->CurrentToken().String;
 
-		State->ExpectAndAdvance('(', u8"Expected '(' after function name");
-		State->ExpectAndAdvance(token_type::KeywordVoid, u8"Expected 'void' for function parameters");
-		State->ExpectAndAdvance(')', u8"Expected ')' after function parameters");
-		State->ExpectAndAdvance('{', u8"Expected '{' to start function body");
+		State->ExpectAndAdvance('(', "Expected '(' after function name");
+		State->ExpectAndAdvance(token_type::KeywordVoid, "Expected 'void' for function parameters");
+		State->ExpectAndAdvance(')', "Expected ')' after function parameters");
+		State->ExpectAndAdvance('{', "Expected '{' to start function body");
 
 		FunctionDecl.FunctionBody = ParseStatement(State);
 
-		State->ExpectAndAdvance('}', u8"Expected '}' to end function body");
+		State->ExpectAndAdvance('}', "Expected '}' to end function body");
 
 		FunctionList.Push(FunctionDecl);
 	}
@@ -318,27 +346,27 @@ static void PrettyPrintAst(ast_node *Node, u32 Indent = 0) {
 	if (Node == &DefaultAstNode) return;
 
 	for (u32 i = 0; i < Indent; ++i) {
-		Print(u8"  ");
+		Print("  ");
 	}
 
 	switch (Node->Type) {
 		case ast_node_type::Return:
-			Print(u8"Return Statement:\n");
+			Print("Return Statement:\n");
 			PrettyPrintAst(Node->ReturnStatement.Expression, Indent + 1);
 			break;
 		case ast_node_type::IntConstant:
-			Print(u8"Int Constant: %lu\n", Node->IntValue);
+			Print("Int Constant: %lu\n", Node->IntValue);
 			break;
 		case ast_node_type::UnaryNegate:
-			Print(u8"Unary Negate:\n");
+			Print("Unary Negate:\n");
 			PrettyPrintAst(Node->UnaryOperation.Expression, Indent + 1);
 			break;
 		case ast_node_type::UnaryBitwiseNegate:
-			Print(u8"Unary Bitwise Not:\n");
+			Print("Unary Bitwise Not:\n");
 			PrettyPrintAst(Node->UnaryOperation.Expression, Indent + 1);
 			break;
 		default:
-			Print(u8"Unknown AST node type\n");
+			Print("Unknown AST node type\n");
 			break;
 	}
 
@@ -351,8 +379,10 @@ namespace assembly {
 		Return,
 		Negate,
 		BitwiseNegate,
+		Add,
+		Subtract
 	};
-	enum class x64_register {
+	enum x64_register {
 		Invalid,
 		EAX,
 		R10D,
@@ -375,7 +405,7 @@ namespace assembly {
 
 	struct instruction {
 		operation Op;
-		operand Src, Dst;
+		operand Src1, Src2, Dst;
 	};
 
 	struct function {
@@ -388,10 +418,10 @@ namespace assembly {
 constexpr string8 RegisterToString(assembly::x64_register Register) {
 	switch (Register) {
 		case assembly::x64_register::EAX: {
-			return string8(u8"%eax");
+			return string8("%eax");
 		} break;
 		case assembly::x64_register::R10D: {
-			return string8(u8"%r10d");
+			return string8("%r10d");
 		} break;
 	}
 
@@ -400,20 +430,20 @@ constexpr string8 RegisterToString(assembly::x64_register Register) {
 
 static void EmitMovInstruction(string8_builder &Builder, const assembly::operand &Src, const assembly::operand &Dst) {
 	if (Src.Type == assembly::operand_type::StackLocation && Dst.Type == assembly::operand_type::StackLocation) {
-		Builder.FormatAndPush(u8"  movl {}(%rbp), %r10d", Src.StackLocation);
-		Builder.FormatAndPush(u8"  movl %r10d, {}(%rbp)", Dst.StackLocation);
+		Builder.FormatAndPush("  movl {}(%rbp), %r10d\n", Src.StackLocation);
+		Builder.FormatAndPush("  movl %r10d, {}(%rbp)\n", Dst.StackLocation);
 		return;
 	}
 
 	if (Src.Type == assembly::operand_type::Immediate) {
-		Builder.FormatAndPush(u8"movl {}, ", Src.ImmediateValue);
+		Builder.FormatAndPush("movl {}, ", Src.ImmediateValue);
 		switch (Dst.Type) {
 			case assembly::operand_type::Register: {
-				Builder.FormatAndPush(u8"{}\n", RegisterToString(Dst.Register));
+				Builder.FormatAndPush("{}\n", RegisterToString(Dst.Register));
 				return;
 			} break;
 			case assembly::operand_type::StackLocation: {
-				Builder.FormatAndPush(u8"{}(%rbp)\n", Dst.StackLocation);
+				Builder.FormatAndPush("{}(%rbp)\n", Dst.StackLocation);
 				return;
 			} break;
 		}
@@ -425,24 +455,24 @@ static void EmitMovInstruction(string8_builder &Builder, const assembly::operand
 			if (Src.Register == Dst.Register) return;
 		}
 
-		Builder.FormatAndPush(u8"  movl {}, ", RegisterToString(Src.Register));
+		Builder.FormatAndPush("  movl {}, ", RegisterToString(Src.Register));
 		switch (Dst.Type) {
 			case assembly::operand_type::Register: {
-				Builder += RegisterToString(Dst.Register) + u8"\n";
+				Builder += RegisterToString(Dst.Register) + "\n";
 				return;
 			} break;
 			case assembly::operand_type::StackLocation: {
-				Builder.FormatAndPush(u8"{}(%rbp)\n", Dst.StackLocation);
+				Builder.FormatAndPush("{}(%rbp)\n", Dst.StackLocation);
 				return;
 			} break;
 		}
 	}
 
 	if (Src.Type == assembly::operand_type::StackLocation) {
-		Builder += string8(u8"  movl ") + Src.StackLocation + u8"(%rbp), ";
+		Builder += string8("  movl ") + Src.StackLocation + "(%rbp), ";
 		switch (Dst.Type) {
 			case assembly::operand_type::Register: {
-				Builder += RegisterToString(Dst.Register) + u8"\n";
+				Builder += RegisterToString(Dst.Register) + "\n";
 				return;
 			} break;
 		}
@@ -451,9 +481,14 @@ static void EmitMovInstruction(string8_builder &Builder, const assembly::operand
 	assert(false);
 }
 
-using main_function_type = s32(*)();
-
 #ifdef RUN_UNIT_TESTS
+static Xbyak::Reg32 X64Registers[] = {
+	[assembly::x64_register::Invalid] = Xbyak::Reg32(0),
+	[assembly::x64_register::EAX] = Xbyak::util::eax,
+	[assembly::x64_register::R10D] = Xbyak::util::r10d
+};
+
+using main_function_type = s32(*)();
 static void LiveJITAssembly(assembly::function *Function, Xbyak::CodeGenerator &x64) {
 	arena_auto_pop DeferredPop(&Temp);
 
@@ -465,16 +500,17 @@ static void LiveJITAssembly(assembly::function *Function, Xbyak::CodeGenerator &
 		x64.mov(rbp, rsp);
 	}
 
-	const auto EmitMovInstruction = [&x64](assembly::operand Src, assembly::operand Dst) {
+	Reg32 X64Registers[(u32)assembly::x64_register::Count];
+	X64Registers[(u32)assembly::x64_register::EAX] = eax;
+	X64Registers[(u32)assembly::x64_register::R10D] = r10d;
+
+
+	const auto EmitMovInstruction = [&x64, &X64Registers](assembly::operand Src, assembly::operand Dst) {
 		if (Src.Type == assembly::operand_type::StackLocation && Dst.Type == assembly::operand_type::StackLocation) {
 			x64.mov(r10d, dword[rbp + Src.StackLocation]);
 			x64.mov(dword[rbp + Dst.StackLocation], r10d);
 			return;
 		}
-
-		Reg32 X64Registers[(u32)assembly::x64_register::Count];
-		X64Registers[(u32)assembly::x64_register::EAX] = eax;
-		X64Registers[(u32)assembly::x64_register::R10D] = r10d;
 
 		if (Src.Type == assembly::operand_type::Immediate && Dst.Type == assembly::operand_type::Register) {
 			Reg32 Register = X64Registers[(u32)Dst.Register];
@@ -500,25 +536,55 @@ static void LiveJITAssembly(assembly::function *Function, Xbyak::CodeGenerator &
 	for (const assembly::instruction &Instruction : Function->Instructions) {
 		switch (Instruction.Op) {
 			case assembly::operation::Mov: {
-				EmitMovInstruction(Instruction.Src, Instruction.Dst);
+				EmitMovInstruction(Instruction.Src1, Instruction.Dst);
 			} break;
 			case assembly::operation::BitwiseNegate: {
-				EmitMovInstruction(Instruction.Src, EAX);
+				EmitMovInstruction(Instruction.Src1, EAX);
 				x64.not(eax);
 				EmitMovInstruction(EAX, Instruction.Dst);
 			} break;
 			case assembly::operation::Negate: {
-				EmitMovInstruction(Instruction.Src, EAX);
+				EmitMovInstruction(Instruction.Src1, EAX);
 				x64.neg(eax);
 				EmitMovInstruction(EAX, Instruction.Dst);
 			} break;
 			case assembly::operation::Return: {
-				EmitMovInstruction(Instruction.Src, EAX);
+				EmitMovInstruction(Instruction.Src1, EAX);
 				if (Function->StackSize > 0) {
 					x64.mov(rsp, rbp);
 					x64.pop(rbp);
 				}
 				x64.ret();
+			} break;
+			case assembly::operation::Add: {
+				EmitMovInstruction(Instruction.Src1, EAX);
+				switch (Instruction.Src2.Type) {
+					case assembly::operand_type::Immediate: {
+						x64.add(eax, Instruction.Src2.ImmediateValue);
+					} break;
+					case assembly::operand_type::Register: {
+						x64.add(eax, X64Registers[(u32)Instruction.Src2.Register]);
+					} break;
+					case assembly::operand_type::StackLocation: {
+						x64.add(eax, dword[rbp + Instruction.Src2.StackLocation]);
+					} break;
+				}
+				EmitMovInstruction(EAX, Instruction.Dst);
+			} break;
+			case assembly::operation::Subtract: {
+				EmitMovInstruction(Instruction.Src1, EAX);
+				switch (Instruction.Src2.Type) {
+					case assembly::operand_type::Immediate: {
+						x64.sub(eax, Instruction.Src2.ImmediateValue);
+					} break;
+					case assembly::operand_type::Register: {
+						x64.sub(eax, X64Registers[(u32)Instruction.Src2.Register]);
+					} break;
+					case assembly::operand_type::StackLocation: {
+						x64.sub(eax, dword[rbp + Instruction.Src2.StackLocation]);
+					} break;
+				}
+				EmitMovInstruction(EAX, Instruction.Dst);
 			} break;
 		}
 	}
@@ -536,13 +602,13 @@ static void EmitAssemblyToFile(assembly::function *Function, const string8 &File
 	OnScopeExit(close(FileDescriptor));
 
 	string8_builder Builder(&Temp);
-	Builder += u8".global main\n"
-			   u8"main:\n";
+	Builder += ".global main\n"
+			   "main:\n";
 
 	if (Function->StackSize > 0) {
-		Builder += u8"  pushq %rbp\n"
-					u8"  movq %rsp, %rbp\n";
-		Builder += string8(u8"  subq  $") + Function->StackSize + u8", %rsp\n";
+		Builder += "  pushq %rbp\n"
+					"  movq %rsp, %rbp\n";
+		Builder += string8("  subq  $") + Function->StackSize + ", %rsp\n";
 	}
 
 	const assembly::operand EAX = { .Type = assembly::operand_type::Register, .Register = assembly::x64_register::EAX };
@@ -550,32 +616,32 @@ static void EmitAssemblyToFile(assembly::function *Function, const string8 &File
 	for (const assembly::instruction &Instruction : Function->Instructions) {
 		switch (Instruction.Op) {
 			case assembly::operation::Mov: {
-				EmitMovInstruction(Builder, Instruction.Src, Instruction.Dst);
+				EmitMovInstruction(Builder, Instruction.Src1, Instruction.Dst);
 			} break;
 			case assembly::operation::BitwiseNegate: {
-				EmitMovInstruction(Builder, Instruction.Src, EAX);
-				Builder += u8"  not %eax\n";
+				EmitMovInstruction(Builder, Instruction.Src1, EAX);
+				Builder += "  not %eax\n";
 				EmitMovInstruction(Builder, EAX, Instruction.Dst);
 			} break;
 			case assembly::operation::Negate: {
-				EmitMovInstruction(Builder, Instruction.Src, EAX);
-				Builder += u8"  neg %eax\n";
+				EmitMovInstruction(Builder, Instruction.Src1, EAX);
+				Builder += "  neg %eax\n";
 				EmitMovInstruction(Builder, EAX, Instruction.Dst);
 			} break;
 			case assembly::operation::Return: {
-				EmitMovInstruction(Builder, Instruction.Src, Instruction.Dst);
+				EmitMovInstruction(Builder, Instruction.Src1, Instruction.Dst);
 				if (Function->StackSize > 0) {
-					Builder += u8"  movq %rbp, %rsp\n"
-							u8"  popq %rbp\n";
+					Builder += "  movq %rbp, %rsp\n"
+							"  popq %rbp\n";
 				}
-				Builder += u8"  ret\n";
+				Builder += "  ret\n";
 			} break;
 			default:
 				break;
 		}
 	}
 
-	Builder += u8".section .note.GNU-stack,\"\", @progbits\n";
+	Builder += ".section .note.GNU-stack,\"\", @progbits\n";
 
 	string8 FinalString = Builder.FinalizeString();
 	ssize_t BytesWritten = write(FileDescriptor, FinalString.Data, FinalString.Length);
@@ -600,7 +666,9 @@ namespace ir {
 			Invalid,
 			Return,
 			Negate,
-			BitwiseNegate
+			BitwiseNegate,
+			Add,
+			Subtract
 		};
 		opcode Opcode;
 		operand Dst, Src1, Src2;
@@ -617,7 +685,7 @@ static ir::operand EmitExpressionIR(ir::function *Function, ast_node *Expression
 	switch (ExpressionNode->Type) {
 		case ast_node_type::IntConstant: {
 			return { ir::operand::type::Constant, ExpressionNode->IntValue };
-		} break;
+		}
 		case ast_node_type::UnaryNegate:
 		case ast_node_type::UnaryBitwiseNegate: {
 			ir::operand Src = EmitExpressionIR(Function, ExpressionNode->UnaryOperation.Expression);
@@ -627,7 +695,18 @@ static ir::operand EmitExpressionIR(ir::function *Function, ast_node *Expression
 			ir::instruction NewInstruction = { .Opcode = Opcode, .Dst = Dst, .Src1 = Src, };
 			Function->Instructions.Push(NewInstruction);
 			return Dst;
-		} break;
+		}
+		case ast_node_type::Add:
+		case ast_node_type::Subtract: {
+			ir::operand Left = EmitExpressionIR(Function, ExpressionNode->BinaryOperation.Left);
+			ir::operand Right = EmitExpressionIR(Function, ExpressionNode->BinaryOperation.Right);
+			ir::instruction::opcode Opcode = (ExpressionNode->Type == ast_node_type::Add)
+				? ir::instruction::opcode::Add : ir::instruction::opcode::Subtract;
+			ir::operand Dst = { ir::operand::type::Temp, Function->TempCount++ };
+			ir::instruction NewInstruction = { .Opcode = Opcode, .Dst = Dst, .Src1 = Left, .Src2 = Right };
+			Function->Instructions.Push(NewInstruction);
+			return Dst;
+		}
 		default:;
 	}
 
@@ -673,17 +752,15 @@ static void PrintAssemblyInstructions(const assembly::function &Function) {
 	auto PrintOperand = [&](const assembly::operand &Op, string8_builder &Builder) {
 		switch (Op.Type) {
 			case assembly::operand_type::Immediate: {
-				Builder += u8"$" + Op.ImmediateValue;
-				Builder += Op.ImmediateValue;
+				Builder.FormatAndPush("${}", Op.ImmediateValue);
 			} break;
 			case assembly::operand_type::Register:
 				switch (Op.Register) {
-					case assembly::x64_register::EAX: Builder += u8"%rax"; break;
-					case assembly::x64_register::R10D: Builder += u8"%r10"; break;
+					case assembly::x64_register::EAX: Builder += "%rax"; break;
+					case assembly::x64_register::R10D: Builder += "%r10"; break;
 				} break;
 			case assembly::operand_type::StackLocation: {
-				Builder += Op.StackLocation;
-				Builder += u8"(%rsp)";
+				Builder.FormatAndPush("{}(%rsp)", Op.StackLocation);
 			} break;
 			default:;
 		}
@@ -693,31 +770,31 @@ static void PrintAssemblyInstructions(const assembly::function &Function) {
 	for (const assembly::instruction &Instruction : Function.Instructions) {
 		switch (Instruction.Op) {
 			case assembly::operation::Negate: {
-				Builder += u8"negate ";
-				PrintOperand(Instruction.Src, Builder);
-				Builder += u8" -> ";
+				Builder += "negate ";
+				PrintOperand(Instruction.Src1, Builder);
+				Builder += " -> ";
 				PrintOperand(Instruction.Dst, Builder);
-				Builder += u8"\n";
+				Builder += "\n";
 			} break;
 			case assembly::operation::BitwiseNegate: {
-				Builder += u8"bitwise_negate ";
-				PrintOperand(Instruction.Src, Builder);
-				Builder += u8" -> ";
+				Builder += "bitwise_negate ";
+				PrintOperand(Instruction.Src1, Builder);
+				Builder += " -> ";
 				PrintOperand(Instruction.Dst, Builder);
-				Builder += u8"\n";
+				Builder += "\n";
 			} break;
 			case assembly::operation::Return: {
-				Builder += u8"return ";
-				PrintOperand(Instruction.Src, Builder);
-				Builder += u8" -> ";
+				Builder += "return ";
+				PrintOperand(Instruction.Src1, Builder);
+				Builder += " -> ";
 				PrintOperand(Instruction.Dst, Builder);
-				Builder += u8"\n";
+				Builder += "\n";
 			} break;
 			default: {
 			} break;
 		}
 	}
-	string8::Print(Builder.FinalizeString());
+	Print(Builder.FinalizeString());
 }
 
 static assembly::function IRFunctionToAssembly(memory_arena *Arena, const ir::function &Function) {
@@ -731,27 +808,40 @@ static assembly::function IRFunctionToAssembly(memory_arena *Arena, const ir::fu
 		switch (Instruction.Opcode) {
 			case ir::instruction::opcode::Negate: {
 				AssemblyInstruction.Op = assembly::operation::Negate;
-				AssemblyInstruction.Src = IROperandToAssemblyOperand(Instruction.Src1);
+				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
 				AssemblyInstruction.Dst = IROperandToAssemblyOperand(Instruction.Dst);
 			} break;
 			case ir::instruction::opcode::BitwiseNegate: {
 				AssemblyInstruction.Op = assembly::operation::BitwiseNegate;
-				AssemblyInstruction.Src = IROperandToAssemblyOperand(Instruction.Src1);
+				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
 				AssemblyInstruction.Dst = IROperandToAssemblyOperand(Instruction.Dst);
 			} break;
 			case ir::instruction::opcode::Return: {
 				AssemblyInstruction.Op = assembly::operation::Return;
 				AssemblyInstruction.Dst = { .Type = assembly::operand_type::Register, .Register = assembly::x64_register::EAX };
-				AssemblyInstruction.Src = IROperandToAssemblyOperand(Instruction.Src1);
+				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
+			} break;
+			case ir::instruction::opcode::Add: {
+				AssemblyInstruction.Op = assembly::operation::Add;
+				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
+				AssemblyInstruction.Src2 = IROperandToAssemblyOperand(Instruction.Src2);
+				AssemblyInstruction.Dst = IROperandToAssemblyOperand(Instruction.Dst);
+			} break;
+			case ir::instruction::opcode::Subtract: {
+				AssemblyInstruction.Op = assembly::operation::Subtract;
+				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
+				AssemblyInstruction.Src2 = IROperandToAssemblyOperand(Instruction.Src2);
+				AssemblyInstruction.Dst = IROperandToAssemblyOperand(Instruction.Dst);
 			} break;
 			default: {
+				assert(false);
 				continue;
 			}
 		}
 		Result.Instructions.Push(AssemblyInstruction);
 	}
 
-#if 0
+#if 1
 	PrintAssemblyInstructions(Result);
 #endif
 
@@ -827,7 +917,7 @@ tokenizer_result Tokenize(memory_arena *Arena, const string8 &FileContents) {
 			} while (IsAlphaNumeric(FileContents[i]));
 
 			if (!IsWhitespace(FileContents[i]) && !CharTable[FileContents[i]]) {
-				return CreateError(u8"Invalid character after identifer or keyword", i);
+				return CreateError("Invalid character after identifer or keyword", i);
 			}
 			string8 IdentifierOrKeyword = FileContents.Substring(StartIndex, i);
 			token_type Type = GetAlphaNumericType(IdentifierOrKeyword);
@@ -845,7 +935,7 @@ tokenizer_result Tokenize(memory_arena *Arena, const string8 &FileContents) {
 			} while (IsNumeric(FileContents[i]));
 
 			if (!IsWhitespace(FileContents[i]) && !CharTable[FileContents[i]] || IsAlpha(FileContents[i])) {
-				return CreateError(u8"Invalid character in numeric constant", i);
+				return CreateError("Invalid character in numeric constant", i);
 			}
 
 			u32 Value = 0;
@@ -882,7 +972,7 @@ tokenizer_result Tokenize(memory_arena *Arena, const string8 &FileContents) {
 			continue;
 		}
 
-		return CreateError(u8"Unexpected character", i);
+		return CreateError("Unexpected character", i);
 	}
 
 	return TokenList;
@@ -901,9 +991,9 @@ value_or_error<assembly::function, bool> CompileSourceCode(string8 SourceCode, b
 			string8 Gap = { GapString, Error.ColumnIndex };
 
 			Print(
-				u8"{} on line {}\n"
-				u8"{}\n"
-				u8"{}^\n",
+				"{} on line {}\n"
+				"{}\n"
+				"{}^\n",
 				Error.ErrorMessage, Error.LineNumber,
 				Error.Line,
 				Gap
@@ -920,7 +1010,7 @@ value_or_error<assembly::function, bool> CompileSourceCode(string8 SourceCode, b
 	parse_result ParseResult = ParseProgram(&ParserState);
 	if (ParseResult.HasError) {
 		if (ShowErrors) {
-			Print(u8"Parse Error: {}\n", ParseResult.Error.Message);
+			Print("Parse Error: {}\n", ParseResult.Error.Message);
 		}
 		return false;
 	}
@@ -968,7 +1058,7 @@ bool CompileUnitTest(string8 SourceCode, s32 ExpectedResult) {
 	s32 Result = Main();
 	if (Result != ExpectedResult) {
 		char *SourceCodeCString = SourceCode.ToCString(&Arena);
-		Print(u8"\n{}Expected: {}\nReturned: {}\n", SourceCodeCString, ExpectedResult, Result);
+		Print("\n{}Expected: {}\nReturned: {}\n", SourceCodeCString, ExpectedResult, Result);
 		return false;
 	}
 
@@ -999,7 +1089,7 @@ s32 main(s32 argc, char **argv) {
 			continue;
 		}
 
-		if (CommandLineArgument.EndsWith(u8".c")) {
+		if (CommandLineArgument.EndsWith(".c")) {
 			FilePath = CommandLineArgument;
 			continue;
 		}
@@ -1012,25 +1102,33 @@ s32 main(s32 argc, char **argv) {
 #ifdef RUN_UNIT_TESTS
 	if (ExecuteUnitTests && ExecuteUnitTests) {
 		Print(ANSI_YELLOW "Unit tests enabled\n" ANSI_RESET);
-		for (const unit_test &UnitTest : UnitTestsPass) {
-			Temp.Reset();
+
+		constexpr bool SetBreakpoint = true;
+		constexpr u32 BreakpointIndex = ArrayLen(UnitTestsPass) - 1;
+
+		for (u32 i = 0; i < ArrayLen(UnitTestsPass); ++i) {
+			if (SetBreakpoint && BreakpointIndex == i) {
+				int volatile k = 1;
+			}
+			const unit_test &UnitTest = UnitTestsPass[i];
 			bool Result = CompileUnitTest(UnitTest.SourceCode, UnitTest.ExpectedResult);
 			assert(Result == true);
+			Temp.Reset();
 		}
 
 		for (const string8 &UnitTest : UnitTestsFail) {
-			Temp.Reset();
 			bool Result = CompileUnitTest(UnitTest, 0);
 			assert(Result == false);
+			Temp.Reset();
 		}
 		Print(ANSI_GREEN "All unit tests passed!\n" ANSI_RESET);
 	}
 #endif
 
 	if (FilePath.Length > 0) {
-		Temp.Reset();
-		Print(u8"Compiling File: {}", FilePath);
+		Print("Compiling File: {}", FilePath);
 		CompileFile(FilePath);
+		Temp.Reset();
 	}
 
 	return 0;

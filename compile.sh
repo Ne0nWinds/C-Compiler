@@ -5,7 +5,7 @@
 
 MODE="$1"
 
-CFLAGS="-Wno-switch -fno-exceptions -fno-operator-names"
+CFLAGS="-Wno-c99-designator -Wno-switch -fno-exceptions -fno-operator-names"
 
 if [[ "$MODE" == "--unit-tests" ]]; then
 	CFLAGS="$CFLAGS -DRUN_UNIT_TESTS=1"

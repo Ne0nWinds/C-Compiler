@@ -115,6 +115,15 @@ struct string8 {
 	}
 	constexpr string8(const char8 *CString, u32 InLength) : Data(CString), Length(InLength) { }
 
+	string8(const char *CString) : Length(0) {
+		Data = (const char8 *)CString;
+		char8 *c = (char8 *)CString;
+		while (*c++) {
+			Length += 1;
+		}
+	}
+	string8(const char *CString, u32 InLength)  : Data((const char8 *)CString), Length(InLength) { }
+
 	string8(u64 Value, memory_arena *Arena = &Temp) {
 		*this = FromUnsignedInt(Arena, Value);
 	}
@@ -164,12 +173,6 @@ struct string8 {
 
         return true;
     }
-
-	static void Print(const string8 &String) {
-		if (String.Length) {
-			fwrite(String.Data, 1, String.Length, stdout);
-		}
-	}
 
 	static string8 FromUnsignedInt(memory_arena *Arena, u64 Value) {
 		char8 *Buffer = (char8 *)Arena->Push(20);
@@ -303,9 +306,6 @@ struct string8_builder {
 		return *this;
 	}
 
-	void operator += (const string8 &InString) {
-		Push(InString);
-	}
 	template <typename T>
 	void operator += (const T &Value) {
 		if constexpr (std::is_integral_v<T> && std::is_unsigned_v<T>) {
@@ -314,6 +314,8 @@ struct string8_builder {
 		} else if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
 			string8 String = string8::FromSignedInt(Arena, (s64)Value);
 			Push(String);
+		} else {
+			Push(string8(Value));
 		}
 	}
 
