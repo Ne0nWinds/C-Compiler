@@ -407,7 +407,6 @@ static void Print(const string8 &FormatString, t &&Arg, args&&... Args) {
 	Print(Result);
 }
 
-
 #define ANSI_GREEN u8"\033[0;32m"
 #define ANSI_RED u8"\033[0;31m"
 #define ANSI_YELLOW u8"\033[0;33m"

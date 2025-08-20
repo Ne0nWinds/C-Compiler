@@ -81,7 +81,7 @@ enum token_type : u32 {
 struct token {
 	token_type Type;
 	union {
-		u32 Constant;
+		s64 Constant;
 		string8 String;
 	};
 };
@@ -151,7 +151,8 @@ enum class ast_node_type : u32 {
 	Add,
 	Subtract,
 	Multiply,
-	Division,
+	Divide,
+	Modulo,
 };
 
 struct ast_node {
@@ -200,7 +201,7 @@ struct parser_state {
 	const token &CurrentToken() const {
 		return *Current;
 	}
-	void Expect(char ExpectedType, string8 Message) {
+	void Expect(char ExpectedType, const string8 &Message) {
 		Expect((token_type)ExpectedType, Message);
 	}
 	void Expect(token_type ExpectedType, const string8 &Message) {
@@ -231,7 +232,7 @@ struct parser_state {
 		return Node;
 	}
 
-	ast_node *PushIntConstantNode(u64 Value) {
+	ast_node *PushIntConstantNode(s64 Value) {
 		ast_node *Node = Arena->Push<ast_node>();
 		Node->Type = ast_node_type::IntConstant;
 		Node->IntValue = Value;
@@ -245,23 +246,32 @@ struct parser_state {
 		Node->UnaryOperation.Expression = Expression;
 		return Node;
 	}
-};
 
-static void Expect(bool Condition, const char *Message) {
-	if (!Condition) {
-		PrintError("Parse error: %s", Message);
+	ast_node *PushBinaryOperationNode(ast_node_type Type) {
+		ast_node *Node = Arena->Push<ast_node>();
+		Node->Type = Type;
+		Node->BinaryOperation.Left = &DefaultAstNode;
+		Node->BinaryOperation.Right = &DefaultAstNode;
+		return Node;
 	}
-}
+};
 
 static bool IsUnaryOperator(token_type Type) {
 	return Type == '~' || Type == '-';
 }
 
-static ast_node *Expression(parser_state *State);
+enum precedence : u32 {
+	Min,
+	AddSubtract, // + -
+	MulDiv, // * / %
+	Max
+};
+
+static ast_node *Expression(parser_state *State, precedence MinPrecedence = precedence::AddSubtract);
 
 static ast_node *Factor(parser_state *State) {
 	if (State->CurrentToken().Type == token_type::IntConstant) {
-		u64 Value = State->CurrentToken().Constant;
+		s64 Value = State->CurrentToken().Constant;
 		ast_node *Result = State->PushIntConstantNode(Value);
 		State->AdvanceToken();
 		return Result;
@@ -286,20 +296,50 @@ static ast_node *Factor(parser_state *State) {
 	return &DefaultAstNode;
 }
 
-static ast_node *Expression(parser_state *State) {
+static precedence PrecedenceFromTokenType(token_type Type) {
+	switch (Type) {
+		case '+':
+		case '-': {
+			return precedence::AddSubtract;
+		}
+		case '*':
+		case '/':
+		case '%': {
+			return precedence::MulDiv;
+		}
+		default: {
+			return precedence::Min;
+		}
+	}
+}
+
+static bool IsBinaryOperator(token_type Type) {
+	return PrecedenceFromTokenType(Type) != precedence::Min;
+}
+
+static ast_node *Expression(parser_state *State, precedence MinPrecedence) {
 
 	ast_node *Result = Factor(State);
 
-	while (State->CurrentToken().Type == '+' || State->CurrentToken().Type == '-') {
-		const token_type TokenType = State->CurrentToken().Type;
+	while (PrecedenceFromTokenType(State->CurrentToken().Type) >= MinPrecedence) {
+		const token &BinaryOpToken = State->CurrentToken();
 		State->AdvanceToken();
+		precedence Precedence = PrecedenceFromTokenType(BinaryOpToken.Type);
+		ast_node *Right = Expression(State, (precedence)(Precedence + 1));
 
-		ast_node *BinaryNode = State->Arena->Push<ast_node>();
-		BinaryNode->Type = (TokenType == '+') ? ast_node_type::Add : ast_node_type::Subtract;
-		BinaryNode->BinaryOperation.Left = Result;
-		BinaryNode->BinaryOperation.Right = Factor(State);
+		ast_node_type Type;
+		switch (BinaryOpToken.Type) {
+			case '+': Type = ast_node_type::Add; break;
+			case '-': Type = ast_node_type::Subtract; break;
+			case '*': Type = ast_node_type::Multiply; break;
+			case '/': Type = ast_node_type::Divide; break;
+			case '%': Type = ast_node_type::Modulo; break;
+		}
 
-		Result = BinaryNode;
+		ast_node *BinaryOperatorNode = State->PushBinaryOperationNode(Type);
+		BinaryOperatorNode->BinaryOperation.Left = Result;
+		BinaryOperatorNode->BinaryOperation.Right = Right;
+		Result = BinaryOperatorNode;
 	}
 
 	return Result;
@@ -380,11 +420,15 @@ namespace assembly {
 		Negate,
 		BitwiseNegate,
 		Add,
-		Subtract
+		Subtract,
+		Multiply,
+		Divide,
+		Modulo
 	};
 	enum x64_register {
 		Invalid,
 		EAX,
+		EDX,
 		R10D,
 		Count
 	};
@@ -397,7 +441,7 @@ namespace assembly {
 	struct operand {
 		operand_type Type = operand_type::Invalid;
 		union {
-			u64 ImmediateValue;
+			s32 ImmediateValue;
 			x64_register Register;
 			s64 StackLocation;
 		};
@@ -485,6 +529,7 @@ static void EmitMovInstruction(string8_builder &Builder, const assembly::operand
 static Xbyak::Reg32 X64Registers[] = {
 	[assembly::x64_register::Invalid] = Xbyak::Reg32(0),
 	[assembly::x64_register::EAX] = Xbyak::util::eax,
+	[assembly::x64_register::EDX] = Xbyak::util::edx,
 	[assembly::x64_register::R10D] = Xbyak::util::r10d
 };
 
@@ -500,12 +545,7 @@ static void LiveJITAssembly(assembly::function *Function, Xbyak::CodeGenerator &
 		x64.mov(rbp, rsp);
 	}
 
-	Reg32 X64Registers[(u32)assembly::x64_register::Count];
-	X64Registers[(u32)assembly::x64_register::EAX] = eax;
-	X64Registers[(u32)assembly::x64_register::R10D] = r10d;
-
-
-	const auto EmitMovInstruction = [&x64, &X64Registers](assembly::operand Src, assembly::operand Dst) {
+	const auto EmitMovInstruction = [&x64](assembly::operand Src, assembly::operand Dst) {
 		if (Src.Type == assembly::operand_type::StackLocation && Dst.Type == assembly::operand_type::StackLocation) {
 			x64.mov(r10d, dword[rbp + Src.StackLocation]);
 			x64.mov(dword[rbp + Dst.StackLocation], r10d);
@@ -514,7 +554,7 @@ static void LiveJITAssembly(assembly::function *Function, Xbyak::CodeGenerator &
 
 		if (Src.Type == assembly::operand_type::Immediate && Dst.Type == assembly::operand_type::Register) {
 			Reg32 Register = X64Registers[(u32)Dst.Register];
-			x64.mov(Register, (u32)Src.ImmediateValue);
+			x64.mov(Register, (s32)Src.ImmediateValue);
 			return;
 		}
 		if (Src.Type == assembly::operand_type::StackLocation && Dst.Type == assembly::operand_type::Register) {
@@ -532,6 +572,8 @@ static void LiveJITAssembly(assembly::function *Function, Xbyak::CodeGenerator &
 	};
 
 	constexpr assembly::operand EAX = { .Type = assembly::operand_type::Register, .Register = assembly::x64_register::EAX };
+	constexpr assembly::operand EDX = { .Type = assembly::operand_type::Register, .Register = assembly::x64_register::EDX };
+	constexpr assembly::operand R10D = { .Type = assembly::operand_type::Register, .Register = assembly::x64_register::R10D };
 
 	for (const assembly::instruction &Instruction : Function->Instructions) {
 		switch (Instruction.Op) {
@@ -585,6 +627,58 @@ static void LiveJITAssembly(assembly::function *Function, Xbyak::CodeGenerator &
 					} break;
 				}
 				EmitMovInstruction(EAX, Instruction.Dst);
+			} break;
+			case assembly::operation::Multiply: {
+				EmitMovInstruction(Instruction.Src1, EAX);
+				switch (Instruction.Src2.Type) {
+					case assembly::operand_type::Immediate: {
+						x64.imul(eax, eax, Instruction.Src2.ImmediateValue);
+					} break;
+					case assembly::operand_type::Register: {
+						x64.imul(eax, X64Registers[Instruction.Src2.Register]);
+					} break;
+					case assembly::operand_type::StackLocation: {
+						x64.imul(eax, dword[rbp + Instruction.Src2.StackLocation]);
+					} break;
+				}
+				EmitMovInstruction(EAX, Instruction.Dst);
+			} break;
+			case assembly::operation::Divide: {
+				EmitMovInstruction(Instruction.Src1, EAX);
+				x64.cdq();
+
+				switch (Instruction.Src2.Type) {
+					case assembly::operand_type::Immediate: {
+						EmitMovInstruction(Instruction.Src2, R10D);
+						x64.idiv(r10d);
+					} break;
+					case assembly::operand_type::Register: {
+						x64.idiv(X64Registers[Instruction.Src2.Register]);
+					} break;
+					case assembly::operand_type::StackLocation: {
+						x64.idiv(dword[rbp + Instruction.Src2.StackLocation]);
+					}
+				}
+				EmitMovInstruction(EAX, Instruction.Dst);
+			} break;
+
+			case assembly::operation::Modulo: {
+				EmitMovInstruction(Instruction.Src1, EAX);
+				x64.cdq();
+
+				switch (Instruction.Src2.Type) {
+					case assembly::operand_type::Immediate: {
+						EmitMovInstruction(Instruction.Src2, R10D);
+						x64.idiv(r10d);
+					} break;
+					case assembly::operand_type::Register: {
+						x64.idiv(X64Registers[Instruction.Src2.Register]);
+					} break;
+					case assembly::operand_type::StackLocation: {
+						x64.idiv(dword[rbp + Instruction.Src2.StackLocation]);
+					}
+				}
+				EmitMovInstruction(EDX, Instruction.Dst);
 			} break;
 		}
 	}
@@ -668,7 +762,10 @@ namespace ir {
 			Negate,
 			BitwiseNegate,
 			Add,
-			Subtract
+			Subtract,
+			Multiply,
+			Divide,
+			Modulo,
 		};
 		opcode Opcode;
 		operand Dst, Src1, Src2;
@@ -682,6 +779,22 @@ namespace ir {
 };
 
 static ir::operand EmitExpressionIR(ir::function *Function, ast_node *ExpressionNode) {
+
+	const auto OpcodeFromASTNodeType = [](const ast_node_type Type) -> ir::instruction::opcode {
+		ir::instruction::opcode Result = ir::instruction::opcode::Invalid;
+		switch (Type) {
+			case ast_node_type::Invalid: 			Result = ir::instruction::opcode::Invalid; break;
+			case ast_node_type::UnaryNegate: 		Result = ir::instruction::opcode::Negate; break;
+			case ast_node_type::UnaryBitwiseNegate: Result = ir::instruction::opcode::BitwiseNegate; break;
+			case ast_node_type::Add: 				Result = ir::instruction::opcode::Add; break;
+			case ast_node_type::Subtract: 			Result = ir::instruction::opcode::Subtract; break;
+			case ast_node_type::Multiply: 			Result = ir::instruction::opcode::Multiply; break;
+			case ast_node_type::Divide: 			Result = ir::instruction::opcode::Divide; break;
+			case ast_node_type::Modulo: 			Result = ir::instruction::opcode::Modulo; break;
+		}
+		return Result;
+	};
+
 	switch (ExpressionNode->Type) {
 		case ast_node_type::IntConstant: {
 			return { ir::operand::type::Constant, ExpressionNode->IntValue };
@@ -690,24 +803,27 @@ static ir::operand EmitExpressionIR(ir::function *Function, ast_node *Expression
 		case ast_node_type::UnaryBitwiseNegate: {
 			ir::operand Src = EmitExpressionIR(Function, ExpressionNode->UnaryOperation.Expression);
 			ir::operand Dst = { ir::operand::type::Temp, Function->TempCount++ };
-			ir::instruction::opcode Opcode = (ExpressionNode->Type == ast_node_type::UnaryNegate)
-				? ir::instruction::opcode::Negate : ir::instruction::opcode::BitwiseNegate;
+			ir::instruction::opcode Opcode = OpcodeFromASTNodeType(ExpressionNode->Type);
 			ir::instruction NewInstruction = { .Opcode = Opcode, .Dst = Dst, .Src1 = Src, };
 			Function->Instructions.Push(NewInstruction);
 			return Dst;
 		}
 		case ast_node_type::Add:
-		case ast_node_type::Subtract: {
+		case ast_node_type::Subtract:
+		case ast_node_type::Multiply:
+		case ast_node_type::Divide:
+		case ast_node_type::Modulo: {
 			ir::operand Left = EmitExpressionIR(Function, ExpressionNode->BinaryOperation.Left);
 			ir::operand Right = EmitExpressionIR(Function, ExpressionNode->BinaryOperation.Right);
-			ir::instruction::opcode Opcode = (ExpressionNode->Type == ast_node_type::Add)
-				? ir::instruction::opcode::Add : ir::instruction::opcode::Subtract;
+			ir::instruction::opcode Opcode = OpcodeFromASTNodeType(ExpressionNode->Type);
 			ir::operand Dst = { ir::operand::type::Temp, Function->TempCount++ };
 			ir::instruction NewInstruction = { .Opcode = Opcode, .Dst = Dst, .Src1 = Left, .Src2 = Right };
 			Function->Instructions.Push(NewInstruction);
 			return Dst;
 		}
-		default:;
+		default: {
+			assert(false);
+		};
 	}
 
 	return {};
@@ -803,45 +919,64 @@ static assembly::function IRFunctionToAssembly(memory_arena *Arena, const ir::fu
 	Result.Name = Function.Name;
 	Result.StackSize = Function.TempCount * 8;
 
+	const auto AssemblyOpFromIRInstruction = [](ir::instruction::opcode Opcode) -> assembly::operation {
+		assembly::operation Result = assembly::operation::Invalid;
+		switch (Opcode) {
+			case ir::instruction::opcode::Negate: Result = assembly::operation::Negate; break;
+			case ir::instruction::opcode::BitwiseNegate: Result = assembly::operation::BitwiseNegate; break;
+			case ir::instruction::opcode::Return: Result = assembly::operation::Return; break;
+			case ir::instruction::opcode::Add: Result = assembly::operation::Add; break;
+			case ir::instruction::opcode::Subtract: Result = assembly::operation::Subtract; break;
+			case ir::instruction::opcode::Multiply: Result = assembly::operation::Multiply; break;
+			case ir::instruction::opcode::Divide: Result = assembly::operation::Divide; break;
+			case ir::instruction::opcode::Modulo: Result = assembly::operation::Modulo; break;
+		}
+		return Result;
+	};
+
 	for (const ir::instruction &Instruction : Function.Instructions) {
-		assembly::instruction AssemblyInstruction = {};
 		switch (Instruction.Opcode) {
-			case ir::instruction::opcode::Negate: {
-				AssemblyInstruction.Op = assembly::operation::Negate;
-				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
-				AssemblyInstruction.Dst = IROperandToAssemblyOperand(Instruction.Dst);
-			} break;
+			case ir::instruction::opcode::Negate:
 			case ir::instruction::opcode::BitwiseNegate: {
-				AssemblyInstruction.Op = assembly::operation::BitwiseNegate;
+				assembly::instruction AssemblyInstruction = {};
+				AssemblyInstruction.Op = AssemblyOpFromIRInstruction(Instruction.Opcode);
 				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
 				AssemblyInstruction.Dst = IROperandToAssemblyOperand(Instruction.Dst);
+				Result.Instructions.Push(AssemblyInstruction);
 			} break;
 			case ir::instruction::opcode::Return: {
+				assembly::instruction AssemblyInstruction = {};
 				AssemblyInstruction.Op = assembly::operation::Return;
 				AssemblyInstruction.Dst = { .Type = assembly::operand_type::Register, .Register = assembly::x64_register::EAX };
 				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
+				Result.Instructions.Push(AssemblyInstruction);
 			} break;
-			case ir::instruction::opcode::Add: {
-				AssemblyInstruction.Op = assembly::operation::Add;
+			case ir::instruction::opcode::Add:
+			case ir::instruction::opcode::Subtract:
+			case ir::instruction::opcode::Multiply: {
+				assembly::instruction AssemblyInstruction = {};
+				AssemblyInstruction.Op = AssemblyOpFromIRInstruction(Instruction.Opcode);
 				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
 				AssemblyInstruction.Src2 = IROperandToAssemblyOperand(Instruction.Src2);
 				AssemblyInstruction.Dst = IROperandToAssemblyOperand(Instruction.Dst);
+				Result.Instructions.Push(AssemblyInstruction);
 			} break;
-			case ir::instruction::opcode::Subtract: {
-				AssemblyInstruction.Op = assembly::operation::Subtract;
-				AssemblyInstruction.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
-				AssemblyInstruction.Src2 = IROperandToAssemblyOperand(Instruction.Src2);
-				AssemblyInstruction.Dst = IROperandToAssemblyOperand(Instruction.Dst);
+			case ir::instruction::opcode::Divide:
+			case ir::instruction::opcode::Modulo: {
+				assembly::instruction IDIV = { .Op = AssemblyOpFromIRInstruction(Instruction.Opcode) };
+				IDIV.Dst = IROperandToAssemblyOperand(Instruction.Dst);
+				IDIV.Src1 = IROperandToAssemblyOperand(Instruction.Src1);
+				IDIV.Src2 = IROperandToAssemblyOperand(Instruction.Src2);
+				Result.Instructions.Push(IDIV);
 			} break;
 			default: {
 				assert(false);
 				continue;
 			}
 		}
-		Result.Instructions.Push(AssemblyInstruction);
 	}
 
-#if 1
+#if 0
 	PrintAssemblyInstructions(Result);
 #endif
 
@@ -867,8 +1002,12 @@ tokenizer_result Tokenize(memory_arena *Arena, const string8 &FileContents) {
 	CharTable['}'] = 1;
 	CharTable[';'] = 1;
 	CharTable['~'] = 1;
-	CharTable['-'] = 1;
+
 	CharTable['+'] = 1;
+	CharTable['-'] = 1;
+	CharTable['*'] = 1;
+	CharTable['/'] = 1;
+	CharTable['%'] = 1;
 
 	u32 LineNumber = 1;
 	u32 LineStartIndex = 0;
@@ -1058,7 +1197,7 @@ bool CompileUnitTest(string8 SourceCode, s32 ExpectedResult) {
 	s32 Result = Main();
 	if (Result != ExpectedResult) {
 		char *SourceCodeCString = SourceCode.ToCString(&Arena);
-		Print("\n{}Expected: {}\nReturned: {}\n", SourceCodeCString, ExpectedResult, Result);
+		Print("\nExpected: {}\nReturned: {}\n", ExpectedResult, Result);
 		return false;
 	}
 
@@ -1103,17 +1242,22 @@ s32 main(s32 argc, char **argv) {
 	if (ExecuteUnitTests && ExecuteUnitTests) {
 		Print(ANSI_YELLOW "Unit tests enabled\n" ANSI_RESET);
 
-		constexpr bool SetBreakpoint = true;
+		constexpr bool SetBreakpoint = false;
 		constexpr u32 BreakpointIndex = ArrayLen(UnitTestsPass) - 1;
 
 		for (u32 i = 0; i < ArrayLen(UnitTestsPass); ++i) {
 			if (SetBreakpoint && BreakpointIndex == i) {
-				int volatile k = 1;
+				__builtin_debugtrap();
 			}
 			const unit_test &UnitTest = UnitTestsPass[i];
 			bool Result = CompileUnitTest(UnitTest.SourceCode, UnitTest.ExpectedResult);
-			assert(Result == true);
 			Temp.Reset();
+			if (!Result) {
+				Print(ANSI_RED u8"Unit Test {} Failed:" ANSI_RESET " unit_tests.cpp:{}\n{}\n", i, UnitTest.LineNumber, UnitTest.SourceCode);
+				__builtin_debugtrap();
+				CompileUnitTest(UnitTest.SourceCode, UnitTest.ExpectedResult);
+				exit(-1);
+			}
 		}
 
 		for (const string8 &UnitTest : UnitTestsFail) {
